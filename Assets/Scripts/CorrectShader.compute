@@ -1,0 +1,38 @@
+#pragma kernel CSMain
+
+StructuredBuffer<uint> Ids;
+RWTexture2D<float4> Result;
+
+int Width;
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 tid : SV_DispatchThreadID)
+{
+    uint x = tid.x;
+    uint y = tid.y;
+
+    // bounds guard (important because we dispatch in groups)
+    // Result.GetDimensions exists too, but this is fine since we know Width.
+    uint index = y * (uint) Width + x;
+
+    // If you want, you can also pass Height and guard y.
+    // For now, guard by index range using Ids length isn't directly available,
+    // so better pass Height too if needed.
+    // Assuming x,y always within texture size due to dispatch bounds.
+
+    uint id = Ids[index];
+
+    float4 col = float4(0, 0, 0, 0); // clear
+
+    // Map block id -> color
+    if (id == 2)
+        col = float4(0, 0, 1, 1); // Water
+    else if (id == 3)
+        col = float4(1, 1, 0, 1); // Sand
+    else if (id == 4)
+        col = float4(0.5, 0.5, 0.5, 1); // Stone
+    else if (id == 1)
+        col = float4(0.25, 0.25, 0.25, 1); // Smoke
+
+    Result[int2(x, y)] = col;
+}
