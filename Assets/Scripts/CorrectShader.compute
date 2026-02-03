@@ -1,38 +1,275 @@
-#pragma kernel CSMain
+#pragma kernel Shade
+#pragma kernel BlurH
+#pragma kernel BlurV
+#pragma kernel Composite
 
 StructuredBuffer<uint> Ids;
+
+RWTexture2D<float4> BaseOut; // RGB base + A=1
+RWTexture2D<float> SmokeOut; // 0..1
+RWTexture2D<float> WaterOut; // 0..1
+
+Texture2D<float> InTex; // for blur
+RWTexture2D<float> OutTex; // for blur output
+
+Texture2D<float4> BaseIn; // for composite
+Texture2D<float> SmokeBlur;
+Texture2D<float> WaterMask;
 RWTexture2D<float4> Result;
 
 int Width;
+int Height;
+float Time; // <-- add this (C# already sets it)
+
+// ------------------------------------------------------------
+// Helpers
+// ------------------------------------------------------------
+uint GetId(int2 p)
+{
+    p.x = clamp(p.x, 0, Width - 1);
+    p.y = clamp(p.y, 0, Height - 1);
+    return Ids[p.y * (uint) Width + (uint) p.x];
+}
+
+float Hash12(float2 p)
+{
+    float h = dot(p, float2(127.1, 311.7));
+    return frac(sin(h) * 43758.5453123);
+}
+
+float Noise2(float2 p)
+{
+    // cheap value-noise-like function
+    float2 i = floor(p);
+    float2 f = frac(p);
+
+    float a = Hash12(i);
+    float b = Hash12(i + float2(1, 0));
+    float c = Hash12(i + float2(0, 1));
+    float d = Hash12(i + float2(1, 1));
+
+    float2 u = f * f * (3.0 - 2.0 * f);
+    return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
+}
+
+// edge: boundary factor (0..1)
+// bulk: interior-ness factor (0..1)
+float3 ApplyVariation(uint id, int2 p, float edge, float bulk, float time)
+{
+    float n1 = Noise2(p * 0.08);
+    float n2 = Noise2(p * 0.35 + 13.7);
+    float n3 = Noise2(p * 1.20 + 71.3);
+
+    float3 col = 0;
+
+    if (id == 3) // Sand
+    {
+        col = float3(0.95, 0.82, 0.20);
+
+        // grain + subtle warm/cool shifts
+        float grain = (n3 - 0.5) * 0.20;
+        float warmCool = (n1 - 0.5) * 0.10;
+
+        col *= (1.0 + grain);
+        col += float3(warmCool * 0.06, warmCool * 0.03, -warmCool * 0.05);
+
+        // darker inside piles, brighter near edges
+        col *= (1.0 - bulk * 0.18);
+        col += edge * float3(0.05, 0.04, 0.02);
+    }
+    else if (id == 4) // Stone
+    {
+        col = float3(0.42, 0.44, 0.50);
+
+        // mottling
+        float mott = (n1 - 0.5) * 0.24 + (n2 - 0.5) * 0.06;
+        col *= (1.0 + mott);
+
+        // speckles
+        float speck = step(0.92, n3) * 0.12;
+        col += speck;
+
+        // darker in bulk, slight rim
+        col *= (1.0 - bulk * 0.25);
+        col += edge * float3(0.03, 0.03, 0.04);
+    }
+    else if (id == 2) // Water
+    {
+        col = float3(0.10, 0.33, 0.85);
+
+        // depth feel (darker in interior)
+        col *= (1.0 - bulk * 0.35);
+
+        // subtle shimmer
+        float shimmer = sin((p.x * 0.15 + p.y * 0.05) + time * 1.5) * 0.02;
+        col += shimmer;
+
+        // foam-ish rim
+        col += edge * float3(0.10, 0.14, 0.18);
+    }
+    else if (id == 1) // Smoke
+    {
+        col = float3(0.16, 0.17, 0.19);
+
+        // density variation (smoke should not be flat)
+        float d = saturate(0.55 + (n1 - 0.5) * 0.35 + (n2 - 0.5) * 0.20);
+        col *= d;
+
+        // brighter edges like scattering
+        col += edge * float3(0.05, 0.05, 0.06);
+    }
+    else
+    {
+    // --- SKY / AIR ---
+        float fy = (float) p.y / max(1.0, (float) (Height - 1)); // 0 bottom → 1 top
+
+    // Light sky blues (distinct from water)
+        float3 skyHorizon = float3(0.72, 0.83, 0.95); // light cyan-blue
+        float3 skyZenith = float3(0.45, 0.60, 0.82); // deeper but still light
+
+        float t = smoothstep(0.0, 1.0, fy);
+        float3 sky = lerp(skyHorizon, skyZenith, t);
+
+    // Subtle cloud noise (VERY gentle)
+        float cloud =
+        Noise2(p * 0.015) * 0.6 +
+        Noise2(p * 0.045 + 17.3) * 0.4;
+
+        sky += (cloud - 0.5) * 0.04;
+
+    // Slight vertical light falloff (brighter near horizon)
+        sky *= lerp(1.08, 0.95, t);
+
+        col = saturate(sky);
+    }
+
+
+
+    return saturate(col);
+}
+
+// ------------------------------------------------------------
+// Shade pass: base + masks
+// ------------------------------------------------------------
+[numthreads(8, 8, 1)]
+void Shade(uint3 tid : SV_DispatchThreadID)
+{
+    int2 p = int2(tid.xy);
+    if (p.x >= Width || p.y >= Height)
+        return;
+
+    uint id = GetId(p);
+
+    // Edge + bulk from neighborhood (3x3)
+    int diffCount = 0;
+    int sameCount = 0;
+
+    [unroll]
+    for (int oy = -1; oy <= 1; oy++)
+    [unroll]
+        for (int ox = -1; ox <= 1; ox++)
+        {
+            uint n = GetId(p + int2(ox, oy));
+            diffCount += (n != id);
+            sameCount += (n == id);
+        }
+
+    float edge = saturate(diffCount / 6.0);
+    float bulk = saturate((sameCount - 1) / 8.0);
+
+    float3 col = ApplyVariation(id, p, edge, bulk, Time);
+
+    BaseOut[p] = float4(col, 1.0);
+
+    SmokeOut[p] = (id == 1) ? 1.0 : 0.0;
+    WaterOut[p] = (id == 2) ? 1.0 : 0.0;
+}
+
+// ------------------------------------------------------------
+// Blur passes (smoke)
+// ------------------------------------------------------------
+[numthreads(8, 8, 1)]
+void BlurH(uint3 tid : SV_DispatchThreadID)
+{
+    int2 p = int2(tid.xy);
+    if (p.x >= Width || p.y >= Height)
+        return;
+
+    float w0 = 0.227027, w1 = 0.1945946, w2 = 0.1216216, w3 = 0.054054, w4 = 0.016216;
+
+    float sum = InTex[p] * w0;
+    sum += InTex[int2(max(p.x - 1, 0), p.y)] * w1;
+    sum += InTex[int2(min(p.x + 1, Width - 1), p.y)] * w1;
+    sum += InTex[int2(max(p.x - 2, 0), p.y)] * w2;
+    sum += InTex[int2(min(p.x + 2, Width - 1), p.y)] * w2;
+    sum += InTex[int2(max(p.x - 3, 0), p.y)] * w3;
+    sum += InTex[int2(min(p.x + 3, Width - 1), p.y)] * w3;
+    sum += InTex[int2(max(p.x - 4, 0), p.y)] * w4;
+    sum += InTex[int2(min(p.x + 4, Width - 1), p.y)] * w4;
+
+    OutTex[p] = sum;
+}
 
 [numthreads(8, 8, 1)]
-void CSMain(uint3 tid : SV_DispatchThreadID)
+void BlurV(uint3 tid : SV_DispatchThreadID)
 {
-    uint x = tid.x;
-    uint y = tid.y;
+    int2 p = int2(tid.xy);
+    if (p.x >= Width || p.y >= Height)
+        return;
 
-    // bounds guard (important because we dispatch in groups)
-    // Result.GetDimensions exists too, but this is fine since we know Width.
-    uint index = y * (uint) Width + x;
+    float w0 = 0.227027, w1 = 0.1945946, w2 = 0.1216216, w3 = 0.054054, w4 = 0.016216;
 
-    // If you want, you can also pass Height and guard y.
-    // For now, guard by index range using Ids length isn't directly available,
-    // so better pass Height too if needed.
-    // Assuming x,y always within texture size due to dispatch bounds.
+    float sum = InTex[p] * w0;
+    sum += InTex[int2(p.x, max(p.y - 1, 0))] * w1;
+    sum += InTex[int2(p.x, min(p.y + 1, Height - 1))] * w1;
+    sum += InTex[int2(p.x, max(p.y - 2, 0))] * w2;
+    sum += InTex[int2(p.x, min(p.y + 2, Height - 1))] * w2;
+    sum += InTex[int2(p.x, max(p.y - 3, 0))] * w3;
+    sum += InTex[int2(p.x, min(p.y + 3, Height - 1))] * w3;
+    sum += InTex[int2(p.x, max(p.y - 4, 0))] * w4;
+    sum += InTex[int2(p.x, min(p.y + 4, Height - 1))] * w4;
 
-    uint id = Ids[index];
+    OutTex[p] = sum;
+}
 
-    float4 col = float4(0, 0, 0, 0); // clear
+// ------------------------------------------------------------
+// Composite pass: base + smoke + water interaction
+// ------------------------------------------------------------
+[numthreads(8, 8, 1)]
+void Composite(uint3 tid : SV_DispatchThreadID)
+{
+    int2 p = int2(tid.xy);
+    if (p.x >= Width || p.y >= Height)
+        return;
 
-    // Map block id -> color
-    if (id == 2)
-        col = float4(0, 0, 1, 1); // Water
-    else if (id == 3)
-        col = float4(1, 1, 0, 1); // Sand
-    else if (id == 4)
-        col = float4(0.5, 0.5, 0.5, 1); // Stone
-    else if (id == 1)
-        col = float4(0.25, 0.25, 0.25, 1); // Smoke
+    float4 baseCol = BaseIn[p];
 
-    Result[int2(x, y)] = col;
+    float smoke = saturate(SmokeBlur[p]);
+    float water = saturate(WaterMask[p]);
+
+    // Smoke: tinted + varied + billowy
+    float n = Noise2(p * 0.06 + 19.3);
+    float smokeVar = lerp(0.85, 1.15, n);
+
+    float3 smokeCol = float3(0.10, 0.11, 0.14) * smokeVar;
+    float smokeA = pow(smoke, 1.1) * 1.1;
+
+    baseCol.rgb = lerp(baseCol.rgb, smokeCol, smokeA);
+
+    // Water: small lift + nice interaction with smoke
+    if (water > 0.5)
+    {
+        baseCol.rgb *= 1.05;
+        baseCol.rgb += float3(0.05, 0.09, 0.12) * smoke;
+    }
+
+    // --- Atmospheric fog blending into sky ---
+    float fy = (float) p.y / max(1.0, (float) (Height - 1));
+    float3 fogCol = float3(0.72, 0.83, 0.95); // same as skyHorizon
+    float fog = smoothstep(0.25, 1.0, fy) * 0.35;
+
+    baseCol.rgb = lerp(baseCol.rgb, fogCol, fog);
+
+ 
+    Result[p] = float4(saturate(baseCol.rgb), 1.0);
 }
